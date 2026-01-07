@@ -662,8 +662,93 @@ generate_xray_config() {
             fi
         done < <(echo "$rules" | jq -c '.[]')
         
+        # 独立检查 WARP 配置，确保有 WARP 就生成 outbound（不依赖分流规则）
+        local warp_mode=$(db_get_warp_mode)
+        if [[ -n "$warp_mode" && "$warp_mode" != "disabled" ]]; then
+            # 检查是否已经有 warp outbound（可能在遍历规则时已生成）
+            if ! echo "$outbounds" | jq -e '.[] | select(.tag == "warp" or .tag | startswith("warp-"))' >/dev/null 2>&1; then
+                # 没有 warp outbound，生成一个默认的
+                local warp_out=$(gen_xray_warp_outbound)
+                if [[ -n "$warp_out" ]]; then
+                    # 使用默认 tag "warp"，默认策略 PreferIPv4
+                    local warp_out_default=$(echo "$warp_out" | jq '.tag = "warp"')
+                    # 只有 WireGuard 类型才需要 domainStrategy
+                    if echo "$warp_out_default" | jq -e '.protocol == "wireguard"' >/dev/null 2>&1; then
+                        warp_out_default=$(echo "$warp_out_default" | jq '.settings.domainStrategy = "PreferIPv4"')
+                    fi
+                    outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_default" '. + [$out]')
+                fi
+            fi
+        fi
+
         routing_rules=$(gen_xray_routing_rules)
         [[ -n "$routing_rules" && "$routing_rules" != "[]" ]] && has_routing=true
+        
+        # 检测是否使用了 WARP，如果是，添加保护性直连规则
+        if echo "$outbounds" | jq -e '.[] | select(.tag | startswith("warp"))' >/dev/null 2>&1; then
+            local warp_mode=$(db_get_warp_mode)
+            
+            # 只有 WireGuard 模式需要保护性规则
+            if [[ "$warp_mode" == "wgcf" ]]; then
+                # 生成保护性规则：WARP 服务器和私有 IP 必须直连
+                local warp_protection_rules='[
+                    {
+                        "type": "field",
+                        "domain": ["engage.cloudflareclient.com"],
+                        "outboundTag": "direct"
+                    },
+                    {
+                        "type": "field",
+                        "ip": [
+                            "10.0.0.0/8",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "127.0.0.0/8",
+                            "169.254.0.0/16",
+                            "224.0.0.0/4",
+                            "240.0.0.0/4",
+                            "fc00::/7",
+                            "fe80::/10"
+                        ],
+                        "outboundTag": "direct"
+                    }
+                ]'
+                
+                # 将保护性规则放在最前面
+                if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
+                    routing_rules=$(echo "$warp_protection_rules" | jq --argjson user_rules "$routing_rules" '. + $user_rules')
+                else
+                    routing_rules="$warp_protection_rules"
+                fi
+                has_routing=true
+            elif [[ "$warp_mode" == "official" ]]; then
+                # SOCKS5 模式：UDP 必须直连（warp-cli SOCKS5 不支持 UDP），私有 IP 直连
+                local warp_protection_rules='[
+                    {
+                        "type": "field",
+                        "network": "udp",
+                        "outboundTag": "direct"
+                    },
+                    {
+                        "type": "field",
+                        "ip": [
+                            "10.0.0.0/8",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "127.0.0.0/8"
+                        ],
+                        "outboundTag": "direct"
+                    }
+                ]'
+                
+                if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
+                    routing_rules=$(echo "$warp_protection_rules" | jq --argjson user_rules "$routing_rules" '. + $user_rules')
+                else
+                    routing_rules="$warp_protection_rules"
+                fi
+                has_routing=true
+            fi
+        fi
     fi
     
     # 构建基础配置
@@ -3397,6 +3482,8 @@ generate_singbox_config() {
     local outbounds=$(jq -n --argjson direct "$direct_outbound" '[$direct, {type: "block", tag: "block"}]')
     local routing_rules=""
     local has_routing=false
+    local warp_has_endpoint=false
+    local warp_endpoint_data=""
     
     # 获取分流规则
     local rules=$(db_get_routing_rules)
@@ -3473,12 +3560,23 @@ generate_singbox_config() {
                         warp_strategy="prefer_ipv4"
                         ;;
                 esac
+                if [[ "$warp_has_endpoint" == "true" ]]; then
+                    continue
+                fi
                 if ! echo "$outbounds" | jq -e --arg tag "$warp_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                     local warp_out=$(gen_singbox_warp_outbound)
                     if [[ -n "$warp_out" ]]; then
-                        local warp_out_with_strategy=$(echo "$warp_out" | jq --arg tag "$warp_tag" --arg ds "$warp_strategy" \
-                            '.tag = $tag | .domain_strategy = $ds')
-                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_strategy" '. + [$out]')
+                        if echo "$warp_out" | jq -e '.endpoint' >/dev/null 2>&1; then
+                            local warp_endpoint=$(echo "$warp_out" | jq '.endpoint')
+                            if [[ "$warp_has_endpoint" != "true" ]]; then
+                                warp_has_endpoint=true
+                                warp_endpoint_data="$warp_endpoint"
+                            fi
+                        else
+                            local warp_out_with_strategy=$(echo "$warp_out" | jq --arg tag "$warp_tag" --arg ds "$warp_strategy" \
+                                '.tag = $tag | .domain_strategy = $ds')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_strategy" '. + [$out]')
+                        fi
                     fi
                 fi
             elif [[ "$outbound" == chain:* ]]; then
@@ -3499,8 +3597,102 @@ generate_singbox_config() {
             fi
         done < <(echo "$rules" | jq -c '.[]')
         
+        # 独立检查 WARP 配置，确保有 WARP 就生成 outbound（不依赖分流规则）
+        local warp_mode=$(db_get_warp_mode)
+        if [[ -n "$warp_mode" && "$warp_mode" != "disabled" && "$warp_has_endpoint" != "true" ]]; then
+            # 检查是否已经有 warp outbound（可能在遍历规则时已生成）
+            if ! echo "$outbounds" | jq -e '.[] | select(.tag == "warp" or .tag | startswith("warp-"))' >/dev/null 2>&1; then
+                # 没有 warp outbound，生成一个默认的
+                local warp_out=$(gen_singbox_warp_outbound)
+                if [[ -n "$warp_out" ]]; then
+                    if echo "$warp_out" | jq -e '.endpoint' >/dev/null 2>&1; then
+                        local warp_endpoint=$(echo "$warp_out" | jq '.endpoint')
+                        if [[ "$warp_has_endpoint" != "true" ]]; then
+                            warp_has_endpoint=true
+                            warp_endpoint_data="$warp_endpoint"
+                        fi
+                    else
+                        # 使用默认 tag "warp"，默认策略 prefer_ipv4
+                        local warp_out_default=$(echo "$warp_out" | jq '.tag = "warp"')
+                        # 只有 WireGuard 类型才需要 domain_strategy
+                        if echo "$warp_out_default" | jq -e '.type == "wireguard"' >/dev/null 2>&1; then
+                            warp_out_default=$(echo "$warp_out_default" | jq '.domain_strategy = "prefer_ipv4"')
+                        fi
+                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_default" '. + [$out]')
+                    fi
+                fi
+            fi
+        fi
+
         routing_rules=$(gen_singbox_routing_rules)
-        [[ -n "$routing_rules" && "$routing_rules" != "[]" ]] && has_routing=true
+        if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
+            if [[ "$warp_has_endpoint" == "true" ]]; then
+                routing_rules=$(echo "$routing_rules" | jq 'map(if ((.outbound // "") | startswith("warp")) then .outbound = "warp" else . end)')
+            fi
+            has_routing=true
+        fi
+        
+        # 检测是否使用了 WARP，如果是，添加保护性直连规则
+        if [[ "$warp_has_endpoint" == "true" ]] || echo "$outbounds" | jq -e '.[] | select(.tag | startswith("warp"))' >/dev/null 2>&1; then
+            local warp_mode=$(db_get_warp_mode)
+            
+            # 只有 WireGuard 模式需要保护性规则
+            if [[ "$warp_mode" == "wgcf" ]]; then
+                # 生成保护性规则：WARP 服务器和私有 IP 必须直连
+                local warp_protection_rules='[
+                    {
+                        "outbound": "direct",
+                        "domain": ["engage.cloudflareclient.com"]
+                    },
+                    {
+                        "outbound": "direct",
+                        "ip_cidr": [
+                            "10.0.0.0/8",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "127.0.0.0/8",
+                            "169.254.0.0/16",
+                            "224.0.0.0/4",
+                            "240.0.0.0/4",
+                            "fc00::/7",
+                            "fe80::/10"
+                        ]
+                    }
+                ]'
+                
+                # 将保护性规则放在最前面
+                if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
+                    routing_rules=$(echo "$warp_protection_rules" | jq --argjson user_rules "$routing_rules" '. + $user_rules')
+                else
+                    routing_rules="$warp_protection_rules"
+                fi
+                has_routing=true
+            elif [[ "$warp_mode" == "official" ]]; then
+                # SOCKS5 模式：UDP 必须直连（warp-cli SOCKS5 不支持 UDP），私有 IP 直连
+                local warp_protection_rules='[
+                    {
+                        "network": "udp",
+                        "outbound": "direct"
+                    },
+                    {
+                        "outbound": "direct",
+                        "ip_cidr": [
+                            "10.0.0.0/8",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "127.0.0.0/8"
+                        ]
+                    }
+                ]'
+                
+                if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
+                    routing_rules=$(echo "$warp_protection_rules" | jq --argjson user_rules "$routing_rules" '. + $user_rules')
+                else
+                    routing_rules="$warp_protection_rules"
+                fi
+                has_routing=true
+            fi
+        fi
     fi
     
     # 构建基础配置
@@ -3513,6 +3705,11 @@ generate_singbox_config() {
             route: {rules: [], final: "direct"}
         }')
         
+        # 添加 WireGuard endpoint（如果存在）
+        if [[ "$warp_has_endpoint" == "true" ]]; then
+            base_config=$(echo "$base_config" | jq --argjson ep "$warp_endpoint_data" '.endpoints = [$ep]')
+        fi
+        
         # 添加路由规则
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             base_config=$(echo "$base_config" | jq --argjson rules "$routing_rules" '.route.rules = $rules')
@@ -3523,6 +3720,11 @@ generate_singbox_config() {
             inbounds: [],
             outbounds: [$direct]
         }')
+        
+        # 添加 WireGuard endpoint（如果存在）
+        if [[ "$warp_has_endpoint" == "true" ]]; then
+            base_config=$(echo "$base_config" | jq --argjson ep "$warp_endpoint_data" '.endpoints = [$ep]')
+        fi
     fi
     
     local inbounds="[]"
@@ -5099,9 +5301,31 @@ warp_status() {
 
 # 下载 wgcf 工具
 download_wgcf() {
+    # 检查 file 命令是否存在，不存在则尝试安装
+    if ! command -v file &>/dev/null; then
+        echo -ne "  ${C}▸${NC} 检测到缺少 file 命令，正在安装..."
+        if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
+            apt-get update -qq && apt-get install -y file >/dev/null 2>&1
+        elif [[ "$DISTRO" == "centos" ]]; then
+            yum install -y file >/dev/null 2>&1
+        elif [[ "$DISTRO" == "alpine" ]]; then
+            apk add --no-cache file >/dev/null 2>&1
+        fi
+        
+        if command -v file &>/dev/null; then
+            echo -e " ${G}✓${NC}"
+        else
+            echo -e " ${Y}⚠${NC}"
+            echo -e "  ${Y}提示${NC}: file 命令安装失败，将使用简化验证（仅检查文件大小）"
+        fi
+    fi
+
     # 检查是否已存在有效的 wgcf
     if [[ -x /usr/local/bin/wgcf ]]; then
-        if file /usr/local/bin/wgcf 2>/dev/null | grep -q "ELF"; then
+        if command -v file &>/dev/null && file "/usr/local/bin/wgcf" 2>/dev/null | grep -q "ELF"; then
+            return 0
+        elif ! command -v file &>/dev/null && [[ -s /usr/local/bin/wgcf ]] && [[ $(stat -f%z /usr/local/bin/wgcf 2>/dev/null || stat -c%s /usr/local/bin/wgcf 2>/dev/null) -gt 100000 ]]; then
+            # 降级验证：文件大于 100KB 且可执行
             return 0
         fi
     fi
@@ -5117,29 +5341,95 @@ download_wgcf() {
     [[ -z "$wgcf_ver" || "$wgcf_ver" == "null" ]] && wgcf_ver="2.2.29"
     echo -e " v${wgcf_ver}"
     
+    # 扩展镜像源列表（按优先级排序）
     local wgcf_urls=(
         "https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
-        "https://mirror.ghproxy.com/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
+        "https://ghproxy.net/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
+        "https://ghps.cc/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
+        "https://gh.ddlc.top/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
     )
     
-    rm -f /usr/local/bin/wgcf
-    local try_num=1
-    for url in "${wgcf_urls[@]}"; do
-        echo -ne "  ${C}▸${NC} 下载 wgcf (尝试 $try_num/3)..."
-        if curl -fL -o /usr/local/bin/wgcf "$url" --connect-timeout 30 --max-time 120 2>/dev/null; then
-            if [[ -s /usr/local/bin/wgcf ]] && file /usr/local/bin/wgcf 2>/dev/null | grep -q "ELF"; then
-                chmod +x /usr/local/bin/wgcf
-                echo -e " ${G}✓${NC}"
-                return 0
-            fi
+    # 确保目录存在并可写
+    if [[ ! -d "/usr/local/bin" ]]; then
+        echo -e "  ${Y}提示${NC}: /usr/local/bin 目录不存在，正在创建..."
+        mkdir -p "/usr/local/bin" 2>/dev/null || {
+            _err "无法创建 /usr/local/bin 目录（权限不足？）"
+            return 1
+        }
+    fi
+    
+    if [[ ! -w "/usr/local/bin" ]]; then
+        _err "/usr/local/bin 目录不可写，请检查权限或使用 sudo"
+        return 1
+    fi
+    
+    # 删除旧文件（如果存在）
+    if [[ -f "/usr/local/bin/wgcf" ]]; then
+        echo -ne "  ${C}▸${NC} 删除旧版本..."
+        if rm -f "/usr/local/bin/wgcf" 2>/dev/null; then
+            echo -e " ${G}✓${NC}"
+        else
+            echo -e " ${R}✗${NC}"
+            _err "无法删除旧文件（权限不足或文件被锁定）"
+            return 1
         fi
-        echo -e " ${R}✗${NC}"
-        rm -f /usr/local/bin/wgcf
+    fi
+    
+    local try_num=1
+    local last_error=""
+    for url in "${wgcf_urls[@]}"; do
+        echo -e "  ${C}▸${NC} 下载 wgcf (尝试 $try_num/${#wgcf_urls[@]})"
+        echo -e "    ${D}地址: $url${NC}"
+        
+        # 捕获详细错误
+        last_error=$(curl -fsSL -o "/usr/local/bin/wgcf" -A "Mozilla/5.0" --max-redirs 5 --connect-timeout 15 --max-time 90 "$url" 2>&1)
+        local curl_ret=$?
+        
+        # 详细的验证流程
+        if [[ $curl_ret -eq 0 ]]; then
+            if [[ ! -f "/usr/local/bin/wgcf" ]]; then
+                echo -e "    ${R}✗ 文件未生成${NC}"
+            elif [[ ! -s "/usr/local/bin/wgcf" ]]; then
+                echo -e "    ${R}✗ 文件为空${NC}"
+                rm -f "/usr/local/bin/wgcf"
+            elif command -v file &>/dev/null; then
+                # 有 file 命令：完整验证
+                if ! file "/usr/local/bin/wgcf" 2>/dev/null | grep -q "ELF"; then
+                    echo -e "    ${R}✗ 文件格式错误（非 ELF 可执行文件）${NC}"
+                    echo -e "    ${D}文件类型: $(file "/usr/local/bin/wgcf" 2>/dev/null)${NC}"
+                    rm -f "/usr/local/bin/wgcf"
+                else
+                    chmod +x "/usr/local/bin/wgcf"
+                    echo -e "    ${G}✓ 下载成功${NC}"
+                    return 0
+                fi
+            else
+                # 无 file 命令：降级验证（检查文件大小）
+                local filesize=$(stat -f%z "/usr/local/bin/wgcf" 2>/dev/null || stat -c%s "/usr/local/bin/wgcf" 2>/dev/null)
+                if [[ $filesize -gt 100000 ]]; then
+                    chmod +x "/usr/local/bin/wgcf"
+                    echo -e "    ${G}✓ 下载成功${NC} ${D}(文件大小: $((filesize/1024))KB)${NC}"
+                    return 0
+                else
+                    echo -e "    ${R}✗ 文件大小异常 (${filesize} 字节)${NC}"
+                    rm -f "/usr/local/bin/wgcf"
+                fi
+            fi
+        else
+            echo -e "    ${R}✗ 下载失败 (curl 返回码: $curl_ret)${NC}"
+        fi
+        
+        [[ -n "$last_error" ]] && echo -e "    ${D}错误: $last_error${NC}"
+        rm -f "/usr/local/bin/wgcf"
         ((try_num++))
+        sleep 1
     done
     
     _err "wgcf 下载失败"
+    echo -e "  ${Y}提示${NC}: 所有镜像源均不可用，可能是网络问题"
+    echo -e "  ${Y}手动下载${NC}: https://github.com/ViRb3/wgcf/releases"
+    echo -e "  ${Y}下载后${NC}: 将文件上传到 /usr/local/bin/wgcf 并执行 chmod +x"
     return 1
 }
 
@@ -5205,13 +5495,31 @@ register_warp() {
     return 0
 }
 
+# 规范化 base64 字符串，自动添加正确的填充符
+normalize_base64() {
+    local input="$1"
+    local len=${#input}
+    local mod=$((len % 4))
+
+    # 如果长度不是 4 的倍数，添加 = 填充
+    if [[ $mod -eq 2 ]]; then
+        echo "${input}=="
+    elif [[ $mod -eq 3 ]]; then
+        echo "${input}="
+    else
+        echo "$input"
+    fi
+}
+
 # 解析 wgcf 生成的配置并保存为 JSON
 parse_and_save_warp_config() {
     local conf_file="$1"
     
-    local private_key=$(grep "PrivateKey" "$conf_file" | cut -d'=' -f2 | tr -d ' ')
-    local public_key=$(grep "PublicKey" "$conf_file" | cut -d'=' -f2 | tr -d ' ')
-    local endpoint=$(grep "Endpoint" "$conf_file" | cut -d'=' -f2 | tr -d ' ')
+    local private_key=$(grep "PrivateKey" "$conf_file" | cut -d'=' -f2 | xargs)
+    private_key=$(normalize_base64 "$private_key")
+    local public_key=$(grep "PublicKey" "$conf_file" | cut -d'=' -f2 | xargs)
+    public_key=$(normalize_base64 "$public_key")
+    local endpoint=$(grep "Endpoint" "$conf_file" | cut -d'=' -f2 | xargs)
     
     # 解析 Address 行，可能有多行或逗号分隔
     local addresses=$(grep "Address" "$conf_file" | cut -d'=' -f2 | tr -d ' ' | tr '\n' ',' | sed 's/,$//')
@@ -5260,7 +5568,7 @@ gen_xray_warp_outbound() {
         if ! check_cmd warp-cli; then
             return
         fi
-        if ! warp-cli status 2>/dev/null | grep -qi "Connected"; then
+        if [[ ! "$WARP_OFFICIAL_PORT" =~ ^[0-9]+$ ]] || [[ "$WARP_OFFICIAL_PORT" -lt 1 || "$WARP_OFFICIAL_PORT" -gt 65535 ]]; then
             return
         fi
         
@@ -5284,8 +5592,9 @@ gen_xray_warp_outbound() {
     
     local private_key=$(jq -r '.private_key' "$WARP_CONF_FILE")
     local public_key=$(jq -r '.public_key' "$WARP_CONF_FILE")
-    local address_v4=$(jq -r '.address_v4' "$WARP_CONF_FILE" | cut -d'/' -f1)
-    local address_v6=$(jq -r '.address_v6' "$WARP_CONF_FILE" | cut -d'/' -f1)
+    # 必须保留完整 CIDR 掩码，避免下游解析失败
+    local address_v4=$(jq -r '.address_v4' "$WARP_CONF_FILE")
+    local address_v6=$(jq -r '.address_v6' "$WARP_CONF_FILE")
     local endpoint=$(jq -r '.endpoint' "$WARP_CONF_FILE")
     local ep_host=$(echo "$endpoint" | cut -d':' -f1)
     local ep_port=$(echo "$endpoint" | cut -d':' -f2)
@@ -5558,12 +5867,13 @@ configure_warp_official() {
     local status=$(warp-cli status 2>/dev/null)
     local is_registered=false
     
-    # 检测多种可能的已注册状态
-    if echo "$status" | grep -qiE "Registration|Account|Status:|Connected|Disconnected"; then
+    # 检测多种可能的已注册状态（排除 Registration Missing）
+    if echo "$status" | grep -qiE "Registration|Account|Status:|Connected|Disconnected" && \
+        ! echo "$status" | grep -qi "Registration Missing"; then
         is_registered=true
     fi
     
-    if [[ "$is_registered" != "true" ]]; then
+    register_warp_account() {
         echo -ne "  ${C}▸${NC} 注册 WARP 账户..."
         local reg_output=""
         local reg_success=false
@@ -5611,10 +5921,20 @@ configure_warp_official() {
         status=$(warp-cli status 2>/dev/null)
         if [[ "$reg_success" == "true" ]] || echo "$status" | grep -qiE "Registration|Account|Status:|Connected|Disconnected"; then
             echo -e " ${G}✓${NC}"
-        else
-            echo -e " ${R}✗${NC}"
-            _err "WARP 账户注册失败"
-            [[ -n "$reg_output" ]] && echo -e "  ${D}$reg_output${NC}"
+            echo -ne "  ${C}▸${NC} 等待配置生效..."
+            sleep 5
+            echo -e " ${G}✓${NC}"
+            return 0
+        fi
+        
+        echo -e " ${R}✗${NC}"
+        _err "WARP 账户注册失败"
+        [[ -n "$reg_output" ]] && echo -e "  ${D}$reg_output${NC}"
+        return 1
+    }
+    
+    if [[ "$is_registered" != "true" ]]; then
+        if ! register_warp_account; then
             return 1
         fi
     else
@@ -5622,8 +5942,8 @@ configure_warp_official() {
     fi
     
     # 先断开现有连接，释放端口
-    warp-cli disconnect 2>/dev/null
-    sleep 1
+    # warp-cli disconnect 2>/dev/null
+    # sleep 1
     
     # 设置为代理模式
     echo -ne "  ${C}▸${NC} 设置代理模式..."
@@ -5637,33 +5957,86 @@ configure_warp_official() {
     echo -ne "  ${C}▸${NC} 设置代理端口 $WARP_OFFICIAL_PORT..."
     warp-cli proxy port "$WARP_OFFICIAL_PORT" 2>/dev/null || warp-cli set-proxy-port "$WARP_OFFICIAL_PORT" 2>/dev/null
     echo -e " ${G}✓${NC}"
+
+    # 【关键】设置完成后验证注册状态（防止设置过程中守护进程重启导致注册丢失）
+    echo -ne "  ${C}▸${NC} 验证注册状态..."
+    sleep 2
+    local verify_status=$(warp-cli status 2>/dev/null)
+    
+    if echo "$verify_status" | grep -qi "Registration Missing"; then
+        echo -e " ${R}✗${NC}"
+        _warn "检测到注册信息丢失，正在重新注册..."
+        
+        # 重启服务并重新注册
+        systemctl restart warp-svc 2>/dev/null
+        sleep 3
+        
+        if ! register_warp_account; then
+            _err "重新注册失败"
+            return 1
+        fi
+        
+        # 重新设置代理模式和端口
+        echo -ne "  ${C}▸${NC} 重新设置代理配置..."
+        warp-cli mode proxy 2>/dev/null
+        warp-cli proxy port "$WARP_OFFICIAL_PORT" 2>/dev/null || warp-cli set-proxy-port "$WARP_OFFICIAL_PORT" 2>/dev/null
+        sleep 2
+        
+        # 最终验证
+        verify_status=$(warp-cli status 2>/dev/null)
+        if echo "$verify_status" | grep -qi "Registration Missing"; then
+            echo -e " ${R}✗${NC}"
+            _err "注册失败：守护进程无法保持注册状态"
+            echo -e "  ${D}状态输出:${NC}"
+            echo "$verify_status" | sed 's/^/    /'
+            return 1
+        fi
+        echo -e " ${G}✓${NC}"
+    else
+        echo -e " ${G}✓${NC}"
+    fi
     
     # 连接 WARP
     echo -ne "  ${C}▸${NC} 连接 WARP..."
     warp-cli connect 2>/dev/null
     
-    # 等待连接成功 (带进度显示)
+    # 等待连接成功 (带进度显示，增加到 60 秒)
     local retry=0
     local connected=false
-    while [[ $retry -lt 15 ]]; do
+    while [[ $retry -lt 30 ]]; do
         sleep 2
-        if warp-cli status 2>/dev/null | grep -qi "Connected"; then
+        local status_output=$(warp-cli status 2>/dev/null)
+        # 改进检测：支持多种状态格式
+        if echo "$status_output" | grep -qiE "(Connected|Status.*Connected)"; then
             connected=true
             break
         fi
-        echo -ne "."
+        echo -n "."
         ((retry++))
     done
     
-    if [[ "$connected" != "true" ]]; then
+    if $connected; then
+        echo -e " ${G}✓${NC}"
+    else
         echo -e " ${R}✗${NC}"
-        _err "WARP 连接超时"
-        echo -e "  ${D}当前状态:${NC}"
-        warp-cli status 2>/dev/null | sed 's/^/  /'
-        return 1
+        
+        # 超时后二次确认最终状态
+        local final_status=$(warp-cli status 2>/dev/null)
+        if echo "$final_status" | grep -qiE "(Connected|Status.*Connected)"; then
+            echo -e "  ${Y}注意${NC}: 连接过程较慢，但最终已成功连接"
+            connected=true
+        else
+            _err "WARP 连接超时"
+            echo -e "  当前状态:"
+            echo "$final_status" | sed 's/^/  /'
+            return 1
+        fi
     fi
     
-    echo -e " ${G}✓${NC}"
+    # 只有真正连接失败才返回错误
+    if ! $connected; then
+        return 1
+    fi
     
     # 保存模式到数据库
     db_set_warp_mode "official"
@@ -5765,12 +6138,14 @@ reconnect_warp_official() {
     sleep 2
     warp-cli connect 2>/dev/null
     
-    # 等待连接 (带进度显示)
+    # 等待连接 (带进度显示，延长到 60 秒)
     echo -ne "  ${C}▸${NC} 等待连接..."
     local retry=0 connected=false
-    while [[ $retry -lt 10 ]]; do
+    while [[ $retry -lt 30 ]]; do
         sleep 2
-        if warp-cli status 2>/dev/null | grep -qi "Connected"; then
+        local status_output=$(warp-cli status 2>/dev/null)
+        # 改进检测：支持多种状态格式
+        if echo "$status_output" | grep -qiE "(Connected|Status.*Connected)"; then
             connected=true
             break
         fi
@@ -5778,10 +6153,25 @@ reconnect_warp_official() {
         ((retry++))
     done
     
-    if [[ "$connected" != "true" ]]; then
+    if $connected; then
+        echo -e " ${G}✓${NC}"
+    else
         echo -e " ${R}✗${NC}"
-        _err "重新连接失败"
-        warp-cli status 2>/dev/null | sed 's/^/  /'
+        
+        # 超时后二次确认最终状态
+        local final_status=$(warp-cli status 2>/dev/null)
+        if echo "$final_status" | grep -qiE "(Connected|Status.*Connected)"; then
+            echo -e "  ${Y}注意${NC}: 连接过程较慢，但最终已成功连接"
+            connected=true
+        else
+            _err "重新连接失败"
+            echo "$final_status" | sed 's/^/  /'
+            return 1
+        fi
+    fi
+    
+    # 只有真正连接成功才继续
+    if ! $connected; then
         return 1
     fi
     
@@ -6357,7 +6747,7 @@ gen_singbox_warp_outbound() {
         if ! check_cmd warp-cli; then
             return
         fi
-        if ! warp-cli status 2>/dev/null | grep -qi "Connected"; then
+        if [[ ! "$WARP_OFFICIAL_PORT" =~ ^[0-9]+$ ]] || [[ "$WARP_OFFICIAL_PORT" -lt 1 || "$WARP_OFFICIAL_PORT" -gt 65535 ]]; then
             return
         fi
         
@@ -6366,7 +6756,8 @@ gen_singbox_warp_outbound() {
             tag: "warp",
             type: "socks",
             server: "127.0.0.1",
-            server_port: $port
+            server_port: $port,
+            version: "5"
         }'
         return
     fi
@@ -6377,8 +6768,9 @@ gen_singbox_warp_outbound() {
     
     local private_key=$(jq -r '.private_key' "$WARP_CONF_FILE")
     local public_key=$(jq -r '.public_key' "$WARP_CONF_FILE")
-    local address_v4=$(jq -r '.address_v4' "$WARP_CONF_FILE" | cut -d'/' -f1)
-    local address_v6=$(jq -r '.address_v6' "$WARP_CONF_FILE" | cut -d'/' -f1)
+    # 必须保留完整 CIDR 掩码，避免下游解析失败
+    local address_v4=$(jq -r '.address_v4' "$WARP_CONF_FILE")
+    local address_v6=$(jq -r '.address_v6' "$WARP_CONF_FILE")
     local endpoint=$(jq -r '.endpoint' "$WARP_CONF_FILE")
     local ep_host=$(echo "$endpoint" | cut -d':' -f1)
     local ep_port=$(echo "$endpoint" | cut -d':' -f2)
@@ -6391,14 +6783,21 @@ gen_singbox_warp_outbound() {
         --arg host "$ep_host" \
         --argjson port "$ep_port" \
     '{
-        tag: "warp",
-        type: "wireguard",
-        private_key: $pk,
-        local_address: [$v4, $v6],
-        peer_public_key: $pub,
-        server: $host,
-        server_port: $port,
-        mtu: 1280
+        endpoint: {
+            type: "wireguard",
+            tag: "warp",
+            system: false,
+            name: "wg-warp",
+            mtu: 1280,
+            address: [$v4, $v6],
+            private_key: $pk,
+            peers: [{
+                address: $host,
+                port: $port,
+                public_key: $pub,
+                allowed_ips: ["0.0.0.0/0", "::/0"]
+            }]
+        }
     }'
 }
 
