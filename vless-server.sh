@@ -2589,7 +2589,7 @@ install_acme_tool() {
     _info "安装 acme.sh 证书申请工具..."
     
     # 方法1: 官方安装脚本
-    if curl -sL https://get.acme.sh | sh -s email=admin@example.com 2>&1 | grep -qE "Install success|already installed"; then
+    if curl -sL https://get.acme.sh | sh -s email=acme@vaio.com 2>&1 | grep -qE "Install success|already installed"; then
         source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
         if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
             _ok "acme.sh 安装成功"
@@ -2601,7 +2601,7 @@ install_acme_tool() {
     if command -v git &>/dev/null; then
         _info "尝试使用 git 安装..."
         if git clone --depth 1 https://github.com/acmesh-official/acme.sh.git /tmp/acme.sh 2>/dev/null; then
-            cd /tmp/acme.sh && ./acme.sh --install -m admin@example.com 2>/dev/null
+            cd /tmp/acme.sh && ./acme.sh --install -m acme@vaio.com 2>/dev/null
             cd - >/dev/null
             rm -rf /tmp/acme.sh
             if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
