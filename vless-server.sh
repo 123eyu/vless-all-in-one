@@ -21,6 +21,7 @@ readonly VERSION="3.1.11"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
+readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
 # curl 超时常量
 readonly CURL_TIMEOUT_FAST=5
@@ -2589,7 +2590,7 @@ install_acme_tool() {
     _info "安装 acme.sh 证书申请工具..."
     
     # 方法1: 官方安装脚本
-    if curl -sL https://get.acme.sh | sh -s email=acme@vaio.com 2>&1 | grep -qE "Install success|already installed"; then
+    if curl -sL https://get.acme.sh | sh -s email="$ACME_DEFAULT_EMAIL" 2>&1 | grep -qE "Install success|already installed"; then
         source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
         if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
             _ok "acme.sh 安装成功"
@@ -2601,7 +2602,7 @@ install_acme_tool() {
     if command -v git &>/dev/null; then
         _info "尝试使用 git 安装..."
         if git clone --depth 1 https://github.com/acmesh-official/acme.sh.git /tmp/acme.sh 2>/dev/null; then
-            cd /tmp/acme.sh && ./acme.sh --install -m acme@vaio.com 2>/dev/null
+            cd /tmp/acme.sh && ./acme.sh --install -m "$ACME_DEFAULT_EMAIL" 2>/dev/null
             cd - >/dev/null
             rm -rf /tmp/acme.sh
             if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
@@ -2625,6 +2626,40 @@ install_acme_tool() {
     _err "acme.sh 安装失败，请检查网络连接"
     _warn "你可以手动安装: curl https://get.acme.sh | sh"
     return 1
+}
+
+# 确保 ACME 账户邮箱有效（避免 example.com 被拒）
+ensure_acme_account_email() {
+    local acme_sh="$1"
+    local account_conf="$HOME/.acme.sh/account.conf"
+    local current_email=""
+    
+    if [[ -f "$account_conf" ]]; then
+        current_email=$(grep -E "^ACCOUNT_EMAIL=" "$account_conf" | head -1 | sed -E "s/^ACCOUNT_EMAIL=['\"]?([^'\"]*)['\"]?$/\1/")
+    fi
+    
+    if [[ -z "$current_email" || "$current_email" == *"example.com"* ]]; then
+        echo ""
+        _info "设置 ACME 账户邮箱为默认值: $ACME_DEFAULT_EMAIL"
+        if [[ -f "$account_conf" ]]; then
+            if grep -q "^ACCOUNT_EMAIL=" "$account_conf"; then
+                sed -i "s/^ACCOUNT_EMAIL=.*/ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'/" "$account_conf"
+            else
+                echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" >> "$account_conf"
+            fi
+        else
+            mkdir -p "$HOME/.acme.sh"
+            echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" > "$account_conf"
+        fi
+        
+        if ! ACCOUNT_EMAIL="$ACME_DEFAULT_EMAIL" "$acme_sh" --register-account -m "$ACME_DEFAULT_EMAIL" >/dev/null 2>&1; then
+            _err "ACME 账户注册失败，请检查网络或稍后重试"
+            return 1
+        fi
+        _ok "ACME 账户邮箱已更新: $ACME_DEFAULT_EMAIL"
+    fi
+    
+    return 0
 }
 
 # DNS-01 验证申请证书
@@ -2698,6 +2733,7 @@ _issue_cert_dns() {
     # 安装 acme.sh
     install_acme_tool || return 1
     local acme_sh="$HOME/.acme.sh/acme.sh"
+    ensure_acme_account_email "$acme_sh" || return 1
     
     _info "正在通过 DNS 验证申请证书..."
     echo ""
@@ -2746,6 +2782,7 @@ _issue_cert_dns_manual() {
     
     install_acme_tool || return 1
     local acme_sh="$HOME/.acme.sh/acme.sh"
+    ensure_acme_account_email "$acme_sh" || return 1
     
     echo ""
     _info "开始手动 DNS 验证..."
@@ -2909,6 +2946,7 @@ get_acme_cert() {
     install_acme_tool || return 1
     
     local acme_sh="$HOME/.acme.sh/acme.sh"
+    ensure_acme_account_email "$acme_sh" || return 1
     
     # 临时停止可能占用 80 端口的服务（兼容 Alpine/systemd）
     local nginx_was_running=false
