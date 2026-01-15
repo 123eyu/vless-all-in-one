@@ -1257,6 +1257,24 @@ urldecode() {
     printf '%b' "${encoded//%/\\x}"
 }
 
+# 解析 URL 查询参数 (key=value&...)
+_get_query_param() {
+    local params="$1"
+    local key="$2"
+    local value=""
+    local IFS='&'
+    local pair=""
+
+    for pair in $params; do
+        if [[ "$pair" == "$key="* ]]; then
+            value="${pair#*=}"
+            break
+        fi
+    done
+
+    echo "$value"
+}
+
 _header() {
     clear; echo "" >&2
     _dline
@@ -1324,9 +1342,6 @@ configure_dns64() {
     fi
     
     _warn "检测到纯 IPv6 环境，准备配置 DNS64..."
-    if ! _confirm_danger_action "配置 DNS64（修改 /etc/resolv.conf）" "系统 DNS 解析配置" "可能影响系统解析与网络访问"; then
-        return 1
-    fi
     
     # 备份原有配置
     if [[ -f /etc/resolv.conf ]] && [[ ! -f /etc/resolv.conf.bak ]]; then
@@ -1377,9 +1392,6 @@ check_dependencies() {
     
     if [[ "$need_install" == "true" ]]; then
         _info "安装缺失的依赖: ${missing_deps[*]}..."
-        if ! _confirm_danger_action "安装系统依赖（${missing_deps[*]}）" "系统软件包与证书组件" "可能修改系统包版本，安装失败将影响后续功能"; then
-            return 1
-        fi
         
         case "$DISTRO" in
             alpine)
@@ -2866,12 +2878,12 @@ _issue_cert_dns_manual() {
     echo ""
     
     # 获取 DNS 记录
-    local txt_record=$("$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | grep -oP "TXT value: '\K[^']+")
+    local txt_record=$("$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p")
     
     if [[ -z "$txt_record" ]]; then
         # 尝试另一种方式获取
         "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee /tmp/acme_manual.log
-        txt_record=$(grep -oP "TXT value: '\K[^']+" /tmp/acme_manual.log 2>/dev/null)
+        txt_record=$(sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p" "/tmp/acme_manual.log" 2>/dev/null)
     fi
     
     if [[ -z "$txt_record" ]]; then
@@ -4537,20 +4549,6 @@ _get_core_version_with_status() {
 
     status=$(_get_version_status "$current" "$latest_stable" "$latest_prerelease")
     echo "${current}${status}"
-}
-
-_confirm_danger_action() {
-    local action="$1" impact="$2" risk="$3"
-    echo "⚠️ 危险操作检测！"
-    echo "操作类型：$action"
-    echo "影响范围：$impact"
-    echo "风险评估：$risk"
-    echo ""
-    read -rp "请确认是否继续？[需要明确的\"是\"、\"确认\"、\"继续\"]: " confirm
-    case "$confirm" in
-        是|确认|继续) return 0 ;;
-        *) _warn "已取消"; return 1 ;;
-    esac
 }
 
 _confirm_core_update() {
@@ -7567,7 +7565,7 @@ _select_best_warp_ipv6_endpoint() {
     
     for ep in "${endpoints[@]}"; do
         # ping6 测试延迟，取平均值
-        local latency=$(ping6 -c 2 -W 1 "$ep" 2>/dev/null | grep -oP 'time=\K[0-9.]+' | awk '{sum+=$1} END {if(NR>0) printf "%.0f", sum/NR; else print 9999}')
+        local latency=$(ping6 -c 2 -W 1 "$ep" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | awk '{sum+=$1} END {if(NR>0) printf "%.0f", sum/NR; else print 9999}')
         [[ -z "$latency" ]] && latency=9999
         
         if [[ "$latency" -lt "$best_latency" ]]; then
@@ -11050,20 +11048,25 @@ parse_proxy_link() {
             [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
             
             # 解析参数
-            local params="${content#*\?}"
-            local security=$(echo "$params" | grep -oP 'security=\K[^&]+' || echo "none")
-            local sni=$(echo "$params" | grep -oP 'sni=\K[^&]+' || echo "")
-            local fp=$(echo "$params" | grep -oP 'fp=\K[^&]+' || echo "chrome")
-            local net=$(echo "$params" | grep -oP 'type=\K[^&]+' || echo "tcp")
-            local pbk=$(echo "$params" | grep -oP 'pbk=\K[^&]+' || echo "")
-            local sid=$(echo "$params" | grep -oP 'sid=\K[^&]+' || echo "")
-            local flow=$(echo "$params" | grep -oP 'flow=\K[^&]+' || echo "")
-            local encryption=$(echo "$params" | grep -oP 'encryption=\K[^&]+' || echo "none")
-            # 提取 ws 协议的 path 和 host 参数
-            local ws_path=$(echo "$params" | grep -oP 'path=\K[^&]+' || echo "/")
-            ws_path=$(urldecode "$ws_path")  # URL 解码 path
-            local ws_host=$(echo "$params" | grep -oP 'host=\K[^&]+' || echo "")
+            local params=""
+            [[ "$content" == *"?"* ]] && params="${content#*\?}"
+            local security=$(_get_query_param "$params" "security")
+            [[ -z "$security" ]] && security="none"
+            local sni=$(_get_query_param "$params" "sni")
+            local fp=$(_get_query_param "$params" "fp")
+            [[ -z "$fp" ]] && fp="chrome"
+            local net=$(_get_query_param "$params" "type")
+            [[ -z "$net" ]] && net="tcp"
+            local pbk=$(_get_query_param "$params" "pbk")
+            local sid=$(_get_query_param "$params" "sid")
+            local flow=$(_get_query_param "$params" "flow")
+            local encryption=$(_get_query_param "$params" "encryption")
             [[ -z "$encryption" ]] && encryption="none"
+            # 提取 ws 协议的 path 和 host 参数
+            local ws_path=$(_get_query_param "$params" "path")
+            [[ -z "$ws_path" ]] && ws_path="/"
+            ws_path=$(urldecode "$ws_path")  # URL 解码 path
+            local ws_host=$(_get_query_param "$params" "host")
             
             [[ -z "$name" ]] && name="VLESS-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$uuid" ]] && result=$(jq -nc \
@@ -11092,8 +11095,10 @@ parse_proxy_link() {
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
             [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
             
-            local params="${content#*\?}"
-            local sni=$(echo "$params" | grep -oP 'sni=\K[^&]+' || echo "$host")
+            local params=""
+            [[ "$content" == *"?"* ]] && params="${content#*\?}"
+            local sni=$(_get_query_param "$params" "sni")
+            [[ -z "$sni" ]] && sni="$host"
             
             [[ -z "$name" ]] && name="Trojan-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$password" ]] && result=$(jq -nc \
@@ -11121,9 +11126,12 @@ parse_proxy_link() {
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
             [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
             
-            local params="${content#*\?}"
-            local sni=$(echo "$params" | grep -oP 'sni=\K[^&]+' || echo "$host")
-            local insecure=$(echo "$params" | grep -oP 'insecure=\K[^&]+' || echo "0")
+            local params=""
+            [[ "$content" == *"?"* ]] && params="${content#*\?}"
+            local sni=$(_get_query_param "$params" "sni")
+            [[ -z "$sni" ]] && sni="$host"
+            local insecure=$(_get_query_param "$params" "insecure")
+            [[ -z "$insecure" ]] && insecure="0"
             
             [[ -z "$name" ]] && name="HY2-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$password" ]] && result=$(jq -nc \
