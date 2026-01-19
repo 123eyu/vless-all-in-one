@@ -23,7 +23,7 @@ readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly SCRIPT_REPO="Chil30/vless-all-in-one"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh"
 readonly CFG="/etc/vless-reality"
-readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
+readonly ACME_DEFAULT_EMAIL="122646606@qq.com"
 
 # curl 超时常量
 readonly CURL_TIMEOUT_FAST=5
